@@ -16,7 +16,7 @@ import pytest
 import torch
 from helpers import assert_similar, random_qactivation, random_qweight, random_tensor
 
-from optimum.quanto import qint2, qint4, qint8
+from optimum.quanto import Calibration, freeze, qfloat8, qint2, qint4, qint8, quantize
 
 
 @pytest.mark.parametrize("batch_size", [1, 10])
@@ -40,6 +40,30 @@ def test_qactivation_qweight_linear(
         inputs = inputs.dequantize()
     out = torch.nn.functional.linear(inputs, qweight.dequantize(), bias)
     assert_similar(out, qout)
+
+
+@pytest.mark.parametrize("activation_qtype", [qint8, qfloat8], ids=["a-qint8", "a-qfloat8"])
+def test_linear_fp16_small_scales(activation_qtype, device):
+    # The product of the input and weight scales is far below the smallest normal fp16 number
+    generator = torch.Generator().manual_seed(0)
+    row_max = torch.tensor([0.01, 0.02, 0.03, 0.05, 0.1, 0.2, 0.5, 1.0])
+    weight = torch.randn(8, 256, generator=generator)
+    weight = weight / weight.abs().amax(1, keepdim=True) * row_max.view(8, 1)
+    inputs = torch.randn(16, 256, generator=generator)
+    inputs = (inputs / inputs.abs().max() * 0.03).half().to(device)
+    model = torch.nn.Sequential(torch.nn.Linear(256, 8, bias=False))
+    model[0].weight.data.copy_(weight)
+    model = model.half().to(device)
+    expected = model(inputs).float()
+    quantize(model, weights=qint8, activations=activation_qtype)
+    with Calibration():
+        model(inputs)
+    freeze(model)
+    with torch.no_grad():
+        out = model(inputs)
+    assert out.dtype == torch.float16
+    error = (out.float() - expected).norm(dim=0) / expected.norm(dim=0)
+    assert error.max() < 0.1
 
 
 @pytest.mark.parametrize("batch_size", [1, 10])
